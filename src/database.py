@@ -11,15 +11,18 @@ from sklearn.model_selection import train_test_split
 
 class SegmentationDataset(Dataset):
     """
-    图像分割数据集类，加载图像和对应的分割掩码
+    图像分割数据集类
 
-    Args:
-        image_dir (str): 图像目录路径
-        mask_dir (str): 掩码目录路径
-        transform (callable, optional): 图像和掩码的联合转换函数
-        image_transform (callable, optional): 仅应用于图像的转换
-        mask_transform (callable, optional): 仅应用于掩码的转换
-        image_extensions (tuple): 支持的图像扩展名
+    用于加载图像和对应的分割掩码，支持多种图像格式。
+    自动匹配图像和掩码文件，支持数据增强和预处理。
+
+    参数:
+        image_dir (str): 图像文件目录路径
+        mask_dir (str): 掩码文件目录路径
+        transform (callable, optional): 图像和掩码的联合转换函数（同时应用于两者）
+        image_transform (callable, optional): 仅应用于图像的转换函数
+        mask_transform (callable, optional): 仅应用于掩码的转换函数
+        image_extensions (tuple): 支持的图像文件扩展名，默认为常见图像格式
     """
 
     def __init__(
@@ -44,66 +47,107 @@ class SegmentationDataset(Dataset):
         self._load_data()
 
     def _load_data(self):
-        """加载图像和对应的掩码路径"""
+        """
+        加载图像和对应的掩码路径
+
+        扫描图像目录，查找所有支持的图像文件，然后尝试在掩码目录中
+        找到对应的掩码文件（相同文件名，不同扩展名）。
+
+        抛出:
+            FileNotFoundError: 如果图像或掩码目录不存在
+        """
+        # 检查目录是否存在
         if not os.path.exists(self.image_dir):
             raise FileNotFoundError(f"图像目录不存在: {self.image_dir}")
         if not os.path.exists(self.mask_dir):
             raise FileNotFoundError(f"掩码目录不存在: {self.mask_dir}")
 
+        # 获取所有支持的图像文件
         image_files = [
             f
             for f in os.listdir(self.image_dir)
             if f.lower().endswith(self.image_extensions)
         ]
-        image_files.sort()
+        image_files.sort()  # 按文件名排序确保可重复性
 
+        # 为每个图像文件查找对应的掩码
         for img_file in image_files:
             img_path = os.path.join(self.image_dir, img_file)
 
+            # 获取文件名（不含扩展名）
             base_name = os.path.splitext(img_file)[0]
             mask_path = None
+
+            # 尝试所有支持的扩展名查找掩码文件
             for ext in self.image_extensions:
                 candidate = os.path.join(self.mask_dir, base_name + ext)
                 if os.path.exists(candidate):
                     mask_path = candidate
                     break
 
+            # 如果未找到掩码，跳过该图像
             if mask_path is None:
                 print(f"警告: 未找到 {img_file} 对应的掩码，跳过")
                 continue
 
+            # 保存匹配的图像-掩码对
             self.image_paths.append(img_path)
             self.mask_paths.append(mask_path)
 
     def __len__(self) -> int:
-        """返回数据集大小"""
+        """
+        返回数据集大小
+
+        返回:
+            int: 数据集中图像-掩码对的数量
+        """
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """获取指定索引的图像和掩码"""
+        """
+        获取指定索引的图像和掩码
+
+        参数:
+            idx (int): 数据索引
+
+        返回:
+            Tuple[torch.Tensor, torch.Tensor]: 图像张量和掩码张量
+
+        抛出:
+            ValueError: 如果无法加载图像或掩码文件
+        """
+        # 获取文件路径
         img_path = self.image_paths[idx]
         mask_path = self.mask_paths[idx]
 
+        # 加载图像（转换为RGB格式）
         try:
             image = Image.open(img_path).convert("RGB")
         except Exception as e:
             raise ValueError(f"无法加载图像 {img_path}: {e}")
 
+        # 加载掩码（转换为灰度格式）
         try:
             mask = Image.open(mask_path).convert("L")
         except Exception as e:
             raise ValueError(f"无法加载掩码 {mask_path}: {e}")
 
+        # 应用联合变换（如果提供）
         if self.transform:
             image, mask = self.transform(image, mask)
         else:
+            # 默认转换：图像转为张量，掩码转为长整型张量
             image = transforms.ToTensor()(image)
             mask = torch.from_numpy(np.array(mask)).long()
+            # 如果掩码值大于1，进行二值化处理
             if mask.max() > 1:
                 mask = (mask > 0).long()
 
+        # 应用单独的图像变换（如果提供）
         if self.image_transform:
             image = self.image_transform(image)
+
+        # 应用单独的掩码变换（如果提供）
         if self.mask_transform:
             mask = self.mask_transform(mask)
 
@@ -112,7 +156,15 @@ class SegmentationDataset(Dataset):
 
 class JointTransform:
     """
-    对图像和掩码应用相同的几何变换
+    联合变换类：对图像和掩码应用相同的几何变换
+
+    确保图像和掩码在数据增强过程中保持空间对齐。
+    支持随机裁剪、水平翻转、旋转和颜色抖动等增强操作。
+
+    参数:
+        image_size (Tuple[int, int]): 输出图像尺寸 (高度, 宽度)
+        augment (bool): 是否启用数据增强
+        num_classes (int): 分割类别数（用于掩码处理）
     """
 
     def __init__(
@@ -121,9 +173,9 @@ class JointTransform:
         augment: bool = False,
         num_classes: int = 2,
     ):
-        self.image_size = image_size
-        self.augment = augment
-        self.num_classes = num_classes
+        self.image_size = image_size  # 目标图像尺寸
+        self.augment = augment  # 是否启用数据增强
+        self.num_classes = num_classes  # 分割类别数
 
     def __call__(
         self, image: Image.Image, mask: Image.Image
@@ -183,18 +235,21 @@ class JointTransform:
 
 class SegmentationDataModule:
     """
-    图像分割数据模块，管理训练集、验证集、测试集和数据加载器
+    图像分割数据模块
 
-    Args:
-        image_dir (str): 图像目录路径
-        mask_dir (str): 掩码目录路径
-        image_size (Tuple[int, int]): 图像尺寸 (height, width)
+    管理训练集、验证集、测试集的划分和数据加载器创建。
+    提供完整的数据处理流水线，包括数据增强、批处理和并行加载。
+
+    参数:
+        image_dir (str): 图像文件目录路径
+        mask_dir (str): 掩码文件目录路径
+        image_size (Tuple[int, int]): 图像尺寸 (高度, 宽度)
         batch_size (int): 批量大小
-        val_split (float): 验证集比例
-        test_split (float): 测试集比例
-        num_workers (int): 数据加载工作进程数
-        seed (int): 随机种子
-        augment (bool): 是否使用数据增强
+        val_split (float): 验证集划分比例 (0.0-1.0)
+        test_split (float): 测试集划分比例 (0.0-1.0)
+        num_workers (int): 数据加载工作进程数（用于并行加载）
+        seed (int): 随机种子（确保可重复性）
+        augment (bool): 是否启用数据增强（仅对训练集）
         num_classes (int): 分割类别数（包括背景）
     """
 

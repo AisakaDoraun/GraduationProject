@@ -2,3 +2,8 @@ data/
 *.jpg
 *.png
 checkpoints/
+TECHNICAL_DOCUMENTATION.md
+TECHNICAL_INSIGHTS.md
+.gitignore
+*.pyc
+TECHNICAL_PRINCIPLES.md

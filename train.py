@@ -16,38 +16,83 @@ from src.model import build_unet
 
 
 class DiceLoss(nn.Module):
-    """Dice loss for segmentation"""
+    """
+    Dice损失函数
+
+    用于图像分割的Dice系数损失，衡量预测分割与真实分割的重叠程度。
+    Dice系数 = 2 * |A ∩ B| / (|A| + |B|)，损失 = 1 - Dice系数。
+
+    参数:
+        smooth (float): 平滑因子，防止除零错误，默认1.0
+    """
 
     def __init__(self, smooth: float = 1.0):
         super().__init__()
-        self.smooth = smooth
+        self.smooth = smooth  # 平滑因子
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        计算Dice损失
+
+        参数:
+            logits (torch.Tensor): 模型输出的logits，形状为 (batch_size, num_classes, height, width)
+            targets (torch.Tensor): 真实标签，形状为 (batch_size, height, width)
+
+        返回:
+            torch.Tensor: Dice损失值
+        """
+        # 将logits转换为概率
         probs = torch.softmax(logits, dim=1)
+
+        # 将目标标签转换为one-hot编码
         targets_one_hot = (
             nn.functional.one_hot(targets, num_classes=logits.shape[1])
             .permute(0, 3, 1, 2)
             .float()
         )
 
+        # 计算交集和并集
         intersection = (probs * targets_one_hot).sum(dim=(2, 3))
         union = probs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
 
+        # 计算Dice系数
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+
+        # 返回Dice损失（1 - Dice系数）
         return 1.0 - dice.mean()
 
 
 class CombinedLoss(nn.Module):
-    """CrossEntropy + Dice loss"""
+    """
+    组合损失函数：交叉熵损失 + Dice损失
+
+    结合了交叉熵损失（关注像素级分类）和Dice损失（关注区域重叠）。
+    这种组合通常能提高分割性能。
+
+    参数:
+        dice_weight (float): Dice损失的权重，默认0.5
+        ce_weight (float): 交叉熵损失的权重，默认0.5
+    """
 
     def __init__(self, dice_weight: float = 0.5, ce_weight: float = 0.5):
         super().__init__()
-        self.dice_weight = dice_weight
-        self.ce_weight = ce_weight
-        self.ce = nn.CrossEntropyLoss()
-        self.dice = DiceLoss()
+        self.dice_weight = dice_weight  # Dice损失权重
+        self.ce_weight = ce_weight  # 交叉熵损失权重
+        self.ce = nn.CrossEntropyLoss()  # 交叉熵损失
+        self.dice = DiceLoss()  # Dice损失
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        计算组合损失
+
+        参数:
+            logits (torch.Tensor): 模型输出的logits
+            targets (torch.Tensor): 真实标签
+
+        返回:
+            torch.Tensor: 加权组合损失值
+        """
+        # 计算加权损失：交叉熵损失 * ce_weight + Dice损失 * dice_weight
         return self.ce_weight * self.ce(logits, targets) + self.dice_weight * self.dice(
             logits, targets
         )
@@ -56,48 +101,111 @@ class CombinedLoss(nn.Module):
 def compute_iou(
     logits: torch.Tensor, targets: torch.Tensor, num_classes: int
 ) -> torch.Tensor:
-    """Compute mean IoU"""
+    """
+    计算平均交并比（mIoU）
+
+    交并比（IoU）是分割任务中常用的评估指标，衡量预测区域与真实区域的重叠程度。
+    mIoU是所有类别IoU的平均值。
+
+    参数:
+        logits (torch.Tensor): 模型输出的logits，形状为 (batch_size, num_classes, height, width)
+        targets (torch.Tensor): 真实标签，形状为 (batch_size, height, width)
+        num_classes (int): 分割类别数
+
+    返回:
+        torch.Tensor: 平均IoU值
+    """
+    # 获取预测类别（取logits中最大值的索引）
     preds = torch.argmax(logits, dim=1)
     ious = []
+
+    # 计算每个类别的IoU
     for cls in range(num_classes):
-        pred_cls = preds == cls
-        target_cls = targets == cls
+        pred_cls = preds == cls  # 预测为该类别的像素
+        target_cls = targets == cls  # 真实为该类别的像素
+
+        # 计算交集和并集
         intersection = (pred_cls & target_cls).sum().float()
         union = (pred_cls | target_cls).sum().float()
+
+        # 避免除零错误
         if union > 0:
             ious.append(intersection / union)
         else:
+            # 如果没有真实或预测像素，IoU定义为1（完美匹配）
             ious.append(torch.tensor(1.0, device=logits.device))
+
+    # 返回所有类别的平均IoU
     return torch.mean(torch.stack(ious))
 
 
 def compute_dice_score(
     logits: torch.Tensor, targets: torch.Tensor, num_classes: int
 ) -> torch.Tensor:
-    """Compute mean Dice score"""
+    """
+    计算平均Dice系数
+
+    Dice系数（F1分数）是分割任务中常用的评估指标，衡量预测区域与真实区域的重叠程度。
+    Dice系数 = 2 * |A ∩ B| / (|A| + |B|)
+
+    参数:
+        logits (torch.Tensor): 模型输出的logits，形状为 (batch_size, num_classes, height, width)
+        targets (torch.Tensor): 真实标签，形状为 (batch_size, height, width)
+        num_classes (int): 分割类别数
+
+    返回:
+        torch.Tensor: 平均Dice系数
+    """
+    # 获取预测类别
     preds = torch.argmax(logits, dim=1)
     dices = []
+
+    # 计算每个类别的Dice系数
     for cls in range(num_classes):
-        pred_cls = preds == cls
-        target_cls = targets == cls
+        pred_cls = preds == cls  # 预测为该类别的像素
+        target_cls = targets == cls  # 真实为该类别的像素
+
+        # 计算交集和总像素数
         intersection = (pred_cls & target_cls).sum().float()
         total = pred_cls.sum().float() + target_cls.sum().float()
+
+        # 避免除零错误
         if total > 0:
             dices.append(2.0 * intersection / total)
         else:
+            # 如果没有真实或预测像素，Dice系数定义为1（完美匹配）
             dices.append(torch.tensor(1.0, device=logits.device))
+
+    # 返回所有类别的平均Dice系数
     return torch.mean(torch.stack(dices))
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs):
-    model.train()
-    running_loss = 0.0
-    running_iou = 0.0
-    running_dice = 0.0
-    num_batches = 0
+    """
+    训练一个epoch
 
+    参数:
+        model: 要训练的模型
+        loader: 训练数据加载器
+        criterion: 损失函数
+        optimizer: 优化器
+        device: 训练设备（CPU/GPU）
+        epoch: 当前epoch索引
+        total_epochs: 总epoch数
+
+    返回:
+        dict: 包含平均损失、IoU和Dice系数的字典
+    """
+    model.train()  # 设置为训练模式
+    running_loss = 0.0  # 累计损失
+    running_iou = 0.0  # 累计IoU
+    running_dice = 0.0  # 累计Dice系数
+    num_batches = 0  # 批次数
+
+    # 格式化epoch字符串（用于显示）
     epoch_str = f"[{epoch + 1:03d}/{total_epochs:03d}]"
 
+    # 创建进度条
     pbar = tqdm(
         loader,
         desc=f"🚀 训练中 {epoch_str}",
@@ -106,24 +214,38 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
         dynamic_ncols=True,
     )
 
+    # 遍历训练数据
     for batch_idx, (images, masks) in enumerate(pbar):
+        # 将数据移动到指定设备
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
+        # 清零梯度
         optimizer.zero_grad()
+
+        # 前向传播
         logits = model(images)
+
+        # 计算损失
         loss = criterion(logits, masks)
+
+        # 反向传播
         loss.backward()
+
+        # 更新参数
         optimizer.step()
 
+        # 计算评估指标
         iou = compute_iou(logits, masks, model.num_classes)
         dice = compute_dice_score(logits, masks, model.num_classes)
 
+        # 累计统计量
         running_loss += loss.item()
         running_iou += iou.item()
         running_dice += dice.item()
         num_batches += 1
 
+        # 定期更新进度条显示
         if batch_idx % 10 == 0 or batch_idx == len(loader) - 1:
             pbar.set_postfix(
                 {
@@ -133,6 +255,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_ep
                 }
             )
 
+    # 计算epoch平均值
     avg_loss = running_loss / num_batches
     avg_iou = running_iou / num_batches
     avg_dice = running_dice / num_batches
